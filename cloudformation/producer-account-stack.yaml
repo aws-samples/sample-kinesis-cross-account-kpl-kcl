@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Producer Account (Account A) resources for the Kinesis cross-account KPL/KCL sample.
+  Creates an EC2 instance with an IAM role that assumes the cross-account write role
+  in the Stream Account (Account B). KPL requires STS AssumeRole because it cannot
+  specify a stream ARN for cross-account writes.
+
+Parameters:
+  ProducerCrossAccountRoleArn:
+    Type: String
+    Description: ARN of KinesisProducerCrossAccountRole from stream-account-stack.yaml (Account B)
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (resolved automatically)
+
+Outputs:
+  KPLProducerRoleArn:
+    Description: ARN of the KPL producer role
+    Value: !GetAtt KPLProducerRole.Arn
+
+  ProducerInstanceId:
+    Description: EC2 instance ID — connect via SSM to build and run the KPL producer
+    Value: !Ref ProducerInstance
+
+Resources:
+
+  KPLProducerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: sts:GetCallerIdentity and cloudwatch:PutMetricData do not support resource-level permissions
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: KPLProducerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Assume the cross-account write role in Account B
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref ProducerCrossAccountRoleArn
+              # KPL requires GetCallerIdentity
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+              # KPL publishes CloudWatch metrics to the producer account
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+              # No KMS grant here: this role never calls KMS directly. It assumes the
+              # cross-account write role in Account B, and that role's identity policy
+              # authorizes the server-side KMS encrypt/decrypt on the stream's key.
+
+  KPLProducerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref KPLProducerRole
+
+  ProducerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref KPLProducerInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: kpl-producer
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum install -y java-21-amazon-corretto-headless maven git

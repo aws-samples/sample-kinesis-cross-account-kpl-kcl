@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stream Account (Account B) resources for the Kinesis cross-account KPL/KCL sample.
+  Creates the Kinesis stream, a cross-account IAM role for the KPL producer (Account A),
+  and resource-based policies for the KCL consumer (Account C).
+
+  HYBRID ARCHITECTURE:
+  - Producer uses STS AssumeRole (KPL limitation: cannot specify stream ARN cross-account)
+  - Consumer uses resource-based policy (KCL 3.x natively supports stream ARN)
+
+Parameters:
+  ProducerAccountId:
+    Type: String
+    Description: AWS Account ID of the producer (Account A)
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  ConsumerAccountId:
+    Type: String
+    Description: AWS Account ID of the consumer (Account C)
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+  ShardCount:
+    Type: Number
+    Default: 2
+
+  EFOConsumerName:
+    Type: String
+    Default: StockTradeConsumerEFO
+    Description: Name of the pre-registered Enhanced Fan-Out consumer shared with Account C
+
+  ExternalId:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      Non-guessable shared secret Account A must present when it assumes the cross-account
+      write role. Mitigates the confused-deputy problem. Supply a unique, random value per
+      deployment - do NOT reuse any example value from the documentation or source.
+
+  ProducerCrossAccountRoleName:
+    Type: String
+    Default: kinesis-xacct-producer-write-role
+    Description: Fixed name for the cross-account write role so its ARN is stable and referenceable.
+
+Outputs:
+  StreamArn:
+    Description: ARN of the Kinesis stream — pass to producer-account-stack.yaml and consumer-account-stack.yaml
+    Value: !GetAtt StockTradeStream.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-StreamArn"
+
+  KMSKeyArn:
+    Description: ARN of the customer-managed KMS key — pass to producer-account-stack.yaml and consumer-account-stack.yaml
+    Value: !GetAtt StreamKMSKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KMSKeyArn"
+
+  ProducerCrossAccountRoleArn:
+    Description: ARN of the cross-account write role — pass to producer-account-stack.yaml
+    Value: !GetAtt KinesisProducerCrossAccountRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ProducerCrossAccountRoleArn"
+
+  EFOConsumerArn:
+    Description: ARN of the pre-registered Enhanced Fan-Out consumer — pass to the KCL app with --efo
+    Value: !GetAtt EFOConsumer.ConsumerARN
+    Export:
+      Name: !Sub "${AWS::StackName}-EFOConsumerArn"
+
+Resources:
+
+  # ── Customer-managed KMS key (shared cross-account) ─────────────────────
+  StreamKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Customer-managed key for the cross-account Kinesis stream
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Key administration stays with the key-owning account (Account B). This root grant is
+          # the AWS-recommended anti-lockout statement and MUST remain. The producer's KMS access
+          # is same-account and is delegated to IAM here: the assumed cross-account write role's
+          # identity policy grants kms:GenerateDataKey*/Decrypt (see KinesisProducerCrossAccountRole),
+          # so no separate producer principal is added to this key policy.
+          - Sid: EnableStreamAccountKeyManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: '*'
+          # Consumer decrypt is a genuine cross-account grant. KMS validates that a named principal
+          # exists when the key policy is written, and the consumer role in Account C does not exist
+          # yet at stream-stack deploy time - so we grant to the consumer account and constrain it
+          # with kms:ViaService (calls must flow through Kinesis). Principal-level scoping to the
+          # specific KCLConsumerRole is enforced by that role's identity policy (kms:Decrypt on this
+          # key only) in consumer-account-stack.yaml; cross-account access requires both to allow.
+          - Sid: AllowConsumerAccountDecrypt
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ConsumerAccountId}:root"
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub "kinesis.${AWS::Region}.amazonaws.com"
+
+  StreamKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/kinesis-cross-account-key
+      TargetKeyId: !Ref StreamKMSKey
+
+  StockTradeStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: !Ref ShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamKMSKey
+
+  # ── Cross-account WRITE role for KPL (assumed by Account A) ─────────────
+  # KPL does not support specifying a stream ARN for cross-account writes,
+  # so it must assume a role in the stream-owning account.
+  KinesisProducerCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ProducerCrossAccountRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ProducerAccountId}:root"
+            Action: sts:AssumeRole
+            # The external ID mitigates the confused-deputy problem: Account A must present a
+            # non-guessable value it controls, so a third party cannot trick Account A into
+            # assuming this role on their behalf. It is supplied at deploy time (never hardcoded).
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: KinesisWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:ListShards
+                Resource: !GetAtt StockTradeStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey*
+                  - kms:Decrypt
+                Resource: !GetAtt StreamKMSKey.Arn
+
+  # ── Resource-based policy on the STREAM (consumer read access) ──────────
+  # KCL 3.x supports stream ARN natively, so the consumer uses its local
+  # credentials and the stream's resource policy authorizes the request.
+  # No IAM role assumption needed on the consumer side.
+  #
+  # Two-gate least privilege: this grant is to the consumer ACCOUNT because Kinesis
+  # (like KMS) validates that a named principal exists when the policy is written, and
+  # the consumer role in Account C does not exist yet at stream-stack deploy time.
+  # Principal- and resource-level scoping is enforced by KCLConsumerRole's identity
+  # policy in consumer-account-stack.yaml (specific stream/EFO ARNs, read-only actions).
+  # Cross-account access requires BOTH policies to allow, so account root here does not
+  # grant read to arbitrary principals in Account C.
+  StreamResourcePolicy:
+    Type: AWS::Kinesis::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt StockTradeStream.Arn
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ConsumerReadAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ConsumerAccountId}:root"
+            Action:
+              - kinesis:DescribeStream
+              - kinesis:DescribeStreamSummary
+              - kinesis:ListShards
+              - kinesis:GetRecords
+              - kinesis:GetShardIterator
+            Resource: !GetAtt StockTradeStream.Arn
+
+  # ── Pre-registered EFO consumer ────────────────────────────────────────
+  # With resource-based policies, KCL cannot auto-register stream consumers
+  # cross-account. The stream owner registers it and shares the consumer ARN.
+  EFOConsumer:
+    Type: AWS::Kinesis::StreamConsumer
+    Properties:
+      ConsumerName: !Ref EFOConsumerName
+      StreamARN: !GetAtt StockTradeStream.Arn
+
+  # ── Resource-based policy on the EFO CONSUMER ──────────────────────────
+  # Same two-gate rationale as StreamResourcePolicy: account-level grant here, with
+  # principal/resource scoping enforced by KCLConsumerRole's identity policy.
+  EFOConsumerResourcePolicy:
+    Type: AWS::Kinesis::ResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt EFOConsumer.ConsumerARN
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ConsumerEFOAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ConsumerAccountId}:root"
+            Action:
+              - kinesis:SubscribeToShard
+              - kinesis:DescribeStreamConsumer
+            Resource: !GetAtt EFOConsumer.ConsumerARN

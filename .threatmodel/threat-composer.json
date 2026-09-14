@@ -1,0 +1,128 @@
+{
+  "schema": "1.0",
+  "applicationInfo": {
+    "name": "Kinesis Cross-Account KPL/KCL Sample",
+    "description": "Cross-account streaming pipeline using KPL (AssumeRole) and KCL (resource-based policy) across three AWS accounts"
+  },
+  "assumptions": [
+    {"id": "A1", "content": "All communication uses TLS (enforced by AWS SDKs)"},
+    {"id": "A2", "content": "EC2 instances in default VPC with security groups restricting inbound access"},
+    {"id": "A3", "content": "IMDSv2 enforced (HttpTokens: required) preventing SSRF credential theft"},
+    {"id": "A4", "content": "KMS key rotation is enabled (automatic annual rotation)"},
+    {"id": "A5", "content": "External ID is a shared secret; production should use unique per-customer values"},
+    {"id": "A6", "content": "Deployer IAM permissions are appropriate; sample does not manage deployer IAM"},
+    {"id": "A7", "content": "EC2 instances are ephemeral demo resources; production should use ASGs"}
+  ],
+  "threats": [
+    {
+      "id": "T1",
+      "title": "Confused deputy attack on cross-account role",
+      "description": "A malicious service tricks Account B into granting stream write access to an unauthorized principal by abusing the cross-account AssumeRole trust",
+      "stride": "Spoofing",
+      "severity": "HIGH",
+      "mitigations": ["M1"]
+    },
+    {
+      "id": "T2",
+      "title": "EC2 instance metadata theft via SSRF",
+      "description": "Attacker exploits application vulnerability to steal instance profile credentials from the EC2 metadata service",
+      "stride": "Spoofing",
+      "severity": "MEDIUM",
+      "mitigations": ["M2"]
+    },
+    {
+      "id": "T3",
+      "title": "Stream data tampering via over-privileged producer role",
+      "description": "If producer role has broader permissions than PutRecords, a compromised instance could modify stream configuration or delete the stream",
+      "stride": "Tampering",
+      "severity": "MEDIUM",
+      "mitigations": ["M3"]
+    },
+    {
+      "id": "T4",
+      "title": "DynamoDB lease table poisoning",
+      "description": "Attacker with write access to KCL lease tables could manipulate shard assignments or roll back checkpoints causing data reprocessing",
+      "stride": "Tampering",
+      "severity": "MEDIUM",
+      "mitigations": ["M4"]
+    },
+    {
+      "id": "T5",
+      "title": "Unattributed cross-account writes",
+      "description": "Without CloudTrail, writes from Account A via assumed role cannot be traced to the originating principal",
+      "stride": "Repudiation",
+      "severity": "LOW",
+      "mitigations": ["M5"]
+    },
+    {
+      "id": "T6",
+      "title": "KMS key policy overly broad",
+      "description": "Key policy grants to account root; any principal in the producer/consumer account can potentially encrypt/decrypt stream data",
+      "stride": "Information Disclosure",
+      "severity": "MEDIUM",
+      "mitigations": ["M6"]
+    },
+    {
+      "id": "T7",
+      "title": "Stream data exposure via broad resource policy",
+      "description": "Resource policy grants read access to the entire consumer account root rather than a specific IAM role",
+      "stride": "Information Disclosure",
+      "severity": "MEDIUM",
+      "mitigations": ["M7"]
+    },
+    {
+      "id": "T8",
+      "title": "Internal infrastructure details in git history",
+      "description": "Internal GitLab URLs in commit history could reveal internal tooling if repo is published without history rewrite",
+      "stride": "Information Disclosure",
+      "severity": "LOW",
+      "mitigations": ["M8"]
+    },
+    {
+      "id": "T9",
+      "title": "Shard exhaustion by rogue producer",
+      "description": "Compromised producer writes at maximum rate exhausting shard capacity and starving legitimate consumers",
+      "stride": "Denial of Service",
+      "severity": "MEDIUM",
+      "mitigations": ["M9"]
+    },
+    {
+      "id": "T10",
+      "title": "DynamoDB throttling on lease tables",
+      "description": "High lease-churn scenarios could throttle KCL metadata operations causing consumer stalls",
+      "stride": "Denial of Service",
+      "severity": "LOW",
+      "mitigations": ["M10"]
+    },
+    {
+      "id": "T11",
+      "title": "Producer role escalation to stream write access",
+      "description": "If EC2 instance is compromised, attacker inherits sts:AssumeRole permission and gains cross-account stream write access",
+      "stride": "Elevation of Privilege",
+      "severity": "MEDIUM",
+      "mitigations": ["M11"]
+    },
+    {
+      "id": "T12",
+      "title": "Wildcard resource on CloudWatch and STS actions",
+      "description": "cloudwatch:PutMetricData and sts:GetCallerIdentity use Resource: * which cannot be scoped to specific resources",
+      "stride": "Elevation of Privilege",
+      "severity": "LOW",
+      "mitigations": ["M12"]
+    }
+  ],
+  "mitigations": [
+    {"id": "M1", "content": "External ID condition on AssumeRole trust policy prevents confused deputy attacks", "type": "Preventive"},
+    {"id": "M2", "content": "IMDSv2 enforced via HttpTokens: required; blocks SSRF-based credential theft", "type": "Preventive"},
+    {"id": "M3", "content": "Least-privilege producer role: only PutRecord, PutRecords, DescribeStream, DescribeStreamSummary, ListShards on specific stream ARN", "type": "Preventive"},
+    {"id": "M4", "content": "DynamoDB IAM scoped to specific named tables; no wildcard table access", "type": "Preventive"},
+    {"id": "M5", "content": "CloudTrail enabled by default; AssumeRole and Kinesis API calls logged with source identity", "type": "Detective"},
+    {"id": "M6", "content": "KMS key policy grants only GenerateDataKey*/Decrypt to producer, only Decrypt to consumer; not kms:*", "type": "Preventive"},
+    {"id": "M7", "content": "Accepted for sample; documented that production should scope resource policies to specific IAM roles", "type": "Accepted"},
+    {"id": "M8", "content": "Documented requirement to squash/rewrite git history before pushing to public GitHub", "type": "Preventive"},
+    {"id": "M9", "content": "KPL rate limiting (150%) + Kinesis provisioned capacity (2 shards = 2 MB/s hard limit)", "type": "Preventive"},
+    {"id": "M10", "content": "DynamoDB on-demand mode auto-scales to handle burst lease operations", "type": "Preventive"},
+    {"id": "M11", "content": "KPLProducerRole can only AssumeRole on one specific cross-account role ARN; assumed role scoped to stream-only actions", "type": "Preventive"},
+    {"id": "M12", "content": "AWS service limitation; cannot scope further. Documented with cfn_nag suppression justification.", "type": "Accepted"}
+  ]
+}

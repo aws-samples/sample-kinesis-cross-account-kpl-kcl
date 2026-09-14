@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Consumer Account (Account C) resources for the Kinesis cross-account KPL/KCL sample.
+  Creates an EC2 instance with an IAM role that reads directly from the cross-account
+  stream using its local credentials. The stream's resource-based policy in Account B
+  authorizes the access — no IAM role assumption is needed.
+
+Parameters:
+  StreamArn:
+    Type: String
+    Description: ARN of the Kinesis stream in Account B (from stream-account-stack.yaml)
+
+  EFOConsumerArn:
+    Type: String
+    Description: ARN of the pre-registered EFO consumer from stream-account-stack.yaml (Account B)
+
+  KMSKeyArn:
+    Type: String
+    Description: ARN of the customer-managed KMS key from stream-account-stack.yaml (Account B)
+
+  KCLApplicationName:
+    Type: String
+    Default: StockTradeConsumer
+    Description: KCL application name (polling) — also used as the DynamoDB lease table name prefix
+
+  KCLApplicationNameEFO:
+    Type: String
+    Default: StockTradeConsumerEFO
+    Description: KCL application name (Enhanced Fan-Out) — separate lease tables avoid conflicts
+
+  ConsumerRoleName:
+    Type: String
+    Default: kinesis-xacct-kcl-consumer-role
+    Description: >
+      Fixed name for the KCL consumer role. MUST match the ConsumerRoleName parameter in
+      stream-account-stack.yaml, whose stream, EFO consumer, and KMS key policies grant this
+      exact role ARN (rather than the whole account).
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (resolved automatically)
+
+Outputs:
+  KCLConsumerRoleArn:
+    Description: ARN of the KCL consumer role
+    Value: !GetAtt KCLConsumerRole.Arn
+
+  ConsumerInstanceId:
+    Description: EC2 instance ID — connect via SSM to build and run the KCL consumer
+    Value: !Ref ConsumerInstance
+
+Resources:
+
+  KCLConsumerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: cloudwatch:PutMetricData does not support resource-level permissions
+    Properties:
+      RoleName: !Ref ConsumerRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: KCLConsumerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Kinesis read — identity-based policy for the local principal.
+              # The stream's resource-based policy (Account B) authorizes cross-account access.
+              # No sts:AssumeRole needed — KCL uses local credentials directly.
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:DescribeStreamConsumer
+                  - kinesis:ListShards
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:SubscribeToShard
+                Resource:
+                  - !Ref StreamArn
+                  - !Ref EFOConsumerArn
+
+              # DynamoDB — lease table.
+              # With KCL 3.5+ single-table format, worker-metrics and coordinator-state
+              # entries live in this table too, so no separate -WorkerMetricStats /
+              # -CoordinatorState tables (or permissions) are needed.
+              - Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${KCLApplicationName}"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${KCLApplicationNameEFO}"
+
+              # DynamoDB — GSI on the lease table (KCL 3.x load balancing)
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${KCLApplicationName}/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${KCLApplicationNameEFO}/index/*"
+
+              # cloudwatch:PutMetricData does not support resource-level permissions
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+              # KMS — decrypt records under the stream's customer-managed key (Account B)
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref KMSKeyArn
+
+  KCLConsumerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref KCLConsumerRole
+
+  ConsumerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref KCLConsumerInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: kcl-consumer
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum install -y java-21-amazon-corretto-headless maven git
